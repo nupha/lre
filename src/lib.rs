@@ -1,0 +1,662 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025 John Ray <996351336@qq.com>
+
+//! Rust bindings for the libregexp regular expression library.
+//!
+//! This crate provides safe Rust bindings to the libregexp C library,
+//! which is a lightweight regular expression engine from QuickJS.
+
+#![warn(missing_docs)]
+#![warn(rustdoc::missing_crate_level_docs)]
+#![allow(non_upper_case_globals)]
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(clippy::unreadable_literal)]
+#![allow(clippy::missing_safety_doc)]
+
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+mod error;
+mod ffi;
+mod regex;
+mod safe;
+
+pub use {error::RegexError, regex::Regex, safe::RegexFlags};
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::{c_char, c_int, CStr, CString};
+
+    use libc::size_t;
+
+    use super::*;
+
+    /// Test basic regex compilation through FFI
+    #[test]
+    fn ffi_compile_basic_pattern() {
+        let pattern = CString::new(r"\d+").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as _,
+                0, // No flags
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Compilation should succeed");
+        assert!(bytecode_len > 0, "Bytecode length should be positive");
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test regex compilation with flags
+    #[test]
+    fn ffi_compile_with_flags() {
+        let pattern = CString::new(r"hello").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr().cast(),
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as _,
+                LRE_FLAG_IGNORECASE as c_int,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Compilation with flags should succeed");
+        assert!(bytecode_len > 0, "Bytecode length should be positive");
+
+        // Verify flags are correctly stored
+        let flags = unsafe { lre_get_flags(bytecode) };
+        assert_eq!(
+            flags as u32, LRE_FLAG_IGNORECASE,
+            "Flags should match compiled flags"
+        );
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test compilation error handling
+    #[test]
+    fn ffi_compile_error_handling() {
+        let pattern = CString::new(r"(").unwrap(); // Invalid pattern
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as _,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(
+            bytecode.is_null(),
+            "Invalid pattern should fail compilation"
+        );
+        assert!(
+            !error_buf.is_empty(),
+            "Error buffer should contain error message"
+        );
+
+        let error_msg = unsafe {
+            CStr::from_ptr(error_buf.as_ptr() as *const c_char)
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(!error_msg.is_empty(), "Error message should not be empty");
+    }
+
+    /// Test get_capture_count function
+    #[test]
+    fn ffi_get_capture_count() {
+        let pattern = CString::new(r"(\d+)-(\w+)").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as size_t,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Compilation should succeed");
+
+        let capture_count = unsafe { lre_get_capture_count(bytecode) };
+        assert_eq!(capture_count, 3, "Should have 3 capture groups (0, 1, 2)");
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test get_flags function
+    #[test]
+    fn ffi_get_flags() {
+        let pattern = CString::new(r"test").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as size_t,
+                LRE_FLAG_IGNORECASE as c_int,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Compilation should succeed");
+
+        let flags = unsafe { lre_get_flags(bytecode) };
+        assert!(
+            (flags as u32) & LRE_FLAG_IGNORECASE != 0,
+            "Should have ignore case flag"
+        );
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test basic regex execution
+    #[test]
+    fn ffi_exec_basic_match() {
+        let pattern = CString::new(r"\d+").unwrap();
+        let text = CString::new("abc123def").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as size_t,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Compilation should succeed");
+
+        // Prepare capture array for 1 group (group 0)
+        let mut capture = vec![std::ptr::null_mut(); 2];
+
+        let result = unsafe {
+            lre_exec(
+                capture.as_mut_ptr(),
+                bytecode,
+                text.as_bytes().as_ptr(),
+                0, // Start from beginning
+                text.as_bytes().len() as c_int,
+                0, // 8-bit characters
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(result, 1, "Should find a match");
+        assert!(!capture[0].is_null(), "Start position should be set");
+        assert!(!capture[1].is_null(), "End position should be set");
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test regex execution with no match
+    #[test]
+    fn ffi_exec_no_match() {
+        let pattern = CString::new(r"\d+").unwrap();
+        let text = CString::new("abc").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as size_t,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Compilation should succeed");
+
+        let mut capture = vec![std::ptr::null_mut(); 2];
+
+        let result = unsafe {
+            lre_exec(
+                capture.as_mut_ptr(),
+                bytecode,
+                text.as_bytes().as_ptr(),
+                0,
+                text.as_bytes().len() as c_int,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(result, 0, "Should not find a match");
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test regex execution with capture groups
+    #[test]
+    fn ffi_exec_with_captures() {
+        let pattern = CString::new(r"(\d+)-(\w+)").unwrap();
+        let text = CString::new("123-apple").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as size_t,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Compilation should succeed");
+
+        // 3 capture groups: 0 (full match), 1 (digits), 2 (word)
+        let mut capture = vec![std::ptr::null_mut(); 6];
+
+        let result = unsafe {
+            lre_exec(
+                capture.as_mut_ptr(),
+                bytecode,
+                text.as_bytes().as_ptr(),
+                0,
+                text.as_bytes().len() as c_int,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(result, 1, "Should find a match");
+
+        // Verify all capture groups are set
+        for i in 0..6 {
+            assert!(!capture[i].is_null(), "Capture {} should be set", i);
+        }
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test global flag behavior (ECMA-262 compliance)
+    #[test]
+    fn ffi_global_flag_behavior() {
+        let pattern = CString::new(r"\d+").unwrap();
+        let text = CString::new("1a2b3c").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        // Compile with global flag
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as size_t,
+                LRE_FLAG_GLOBAL as c_int,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Compilation should succeed");
+
+        // Execute multiple times to test global behavior
+        let mut last_index = 0;
+        let mut match_count = 0;
+
+        while last_index < text.as_bytes().len() {
+            let mut capture = vec![std::ptr::null_mut(); 2];
+
+            let result = unsafe {
+                lre_exec(
+                    capture.as_mut_ptr(),
+                    bytecode,
+                    text.as_bytes().as_ptr(),
+                    last_index as c_int,
+                    text.as_bytes().len() as c_int,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+
+            if result == 1 {
+                match_count += 1;
+                // Update last_index for next search
+                last_index =
+                    unsafe { (capture[1].offset_from(text.as_bytes().as_ptr()) + 1) as usize };
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(match_count, 3, "Should find all 3 matches with global flag");
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test case insensitive flag behavior (ECMA-262 compliance)
+    #[test]
+    fn ffi_case_insensitive_behavior() {
+        let pattern = CString::new(r"hello").unwrap();
+        let texts = vec!["hello", "HELLO", "Hello", "hElLo"];
+
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        // Compile with case insensitive flag
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as size_t,
+                LRE_FLAG_IGNORECASE as c_int,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Compilation should succeed");
+
+        for text in texts {
+            let text_cstr = CString::new(text).unwrap();
+            let mut capture = vec![std::ptr::null_mut(); 2];
+
+            let result = unsafe {
+                lre_exec(
+                    capture.as_mut_ptr(),
+                    bytecode,
+                    text_cstr.as_bytes().as_ptr(),
+                    0,
+                    text_cstr.as_bytes().len() as c_int,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+
+            assert_eq!(
+                result, 1,
+                "Should match '{}' with case insensitive flag",
+                text
+            );
+        }
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test memory allocation functions
+    #[test]
+    fn ffi_memory_functions() {
+        // Test stack overflow and timeout callbacks
+        let stack_result = unsafe { lre_check_stack_overflow(std::ptr::null_mut(), 0) };
+        let timeout_result = unsafe { lre_check_timeout(std::ptr::null_mut()) };
+
+        // These should return 0 (no overflow/timeout) with null opaque
+        assert_eq!(stack_result, 0, "Stack overflow check should return 0");
+        assert_eq!(timeout_result, 0, "Timeout check should return 0");
+
+        // Test realloc function
+        let test_size = 100;
+        let ptr = unsafe { lre_realloc(std::ptr::null_mut(), std::ptr::null_mut(), test_size) };
+
+        if !ptr.is_null() {
+            // If allocation succeeded, free the memory
+            unsafe {
+                let _ = libc::free(ptr);
+            }
+        }
+    }
+
+    /// Test ECMA-262 specific regex patterns
+    #[test]
+    fn ffi_ecma262_compliance() {
+        // Test empty pattern
+        let pattern = CString::new("").unwrap();
+        let text = CString::new("test").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as size_t,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Empty pattern should compile");
+
+        // Empty pattern should match everywhere
+        let mut capture = vec![std::ptr::null_mut(); 2];
+        let result = unsafe {
+            lre_exec(
+                capture.as_mut_ptr(),
+                bytecode,
+                text.as_bytes().as_ptr(),
+                0,
+                text.as_bytes().len() as c_int,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(result, 1, "Empty pattern should match");
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test multiline flag behavior
+    #[test]
+    fn ffi_multiline_flag_behavior() {
+        let pattern = CString::new(r"^hello").unwrap();
+        let text = CString::new("hello\nworld\nhello").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        // Compile with multiline flag
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as size_t,
+                LRE_FLAG_MULTILINE as c_int,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Multiline compilation should succeed");
+
+        // With multiline, should match at the beginning of each line
+        let mut multi_match_count = 0;
+        let mut search_pos = 0;
+
+        while search_pos < text.as_bytes().len() {
+            let mut capture = vec![std::ptr::null_mut(); 2];
+            let result = unsafe {
+                lre_exec(
+                    capture.as_mut_ptr(),
+                    bytecode,
+                    text.as_bytes().as_ptr(),
+                    search_pos as c_int,
+                    text.as_bytes().len() as c_int,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+
+            if result == 1 {
+                multi_match_count += 1;
+                search_pos =
+                    unsafe { (capture[1].offset_from(text.as_bytes().as_ptr()) + 1) as usize };
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(
+            multi_match_count, 2,
+            "Should match at start of 2 lines with multiline"
+        );
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test sticky flag behavior
+    #[test]
+    fn ffi_sticky_flag_behavior() {
+        let pattern = CString::new(r"\d+").unwrap();
+        let text = CString::new("a1b2c3").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        // Compile with sticky flag
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as size_t,
+                LRE_FLAG_STICKY as c_int,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Compilation should succeed");
+
+        // Sticky should only match at the specified position
+        let mut capture = vec![std::ptr::null_mut(); 2];
+
+        // Try to match at position 1 (where "1" is)
+        let result = unsafe {
+            lre_exec(
+                capture.as_mut_ptr(),
+                bytecode,
+                text.as_bytes().as_ptr(),
+                1, // Start at position 1
+                text.as_bytes().len() as c_int,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(result, 1, "Should match at sticky position");
+
+        // Try to match at position 0 (where "a" is)
+        let result = unsafe {
+            lre_exec(
+                capture.as_mut_ptr(),
+                bytecode,
+                text.as_bytes().as_ptr(),
+                0, // Start at position 0
+                text.as_bytes().len() as c_int,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert_eq!(result, 0, "Should not match at non-sticky position");
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+
+    /// Test get_groupnames function
+    #[test]
+    fn ffi_get_groupnames() {
+        // Test pattern without named groups
+        let pattern = CString::new(r"(\d+)-(\w+)").unwrap();
+        let mut error_buf = [0u8; 256];
+        let mut bytecode_len: c_int = 0;
+
+        let bytecode = unsafe {
+            lre_compile(
+                &mut bytecode_len as *mut c_int,
+                error_buf.as_mut_ptr() as *mut c_char,
+                256,
+                pattern.as_ptr(),
+                pattern.as_bytes().len() as size_t,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(!bytecode.is_null(), "Compilation should succeed");
+
+        // For patterns without named groups, should return NULL
+        let group_names_ptr = unsafe { lre_get_groupnames(bytecode) };
+        assert!(
+            group_names_ptr.is_null(),
+            "Should return NULL for patterns without named groups"
+        );
+
+        unsafe {
+            let _ = libc::free(bytecode as *mut libc::c_void);
+        }
+    }
+}

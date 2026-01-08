@@ -1,0 +1,36 @@
+[package]
+name = "lre"
+version = "0.1.0"
+edition = "2021"
+authors = ["John Ray <996351336@qq.com>"]
+description = "Rust bindings for the regular expression library from QuickJS"
+license = "MIT"
+readme = "README.md"
+keywords = ["regex", "regular-expression"]
+categories = ["text-processing"]
+
+[lib]
+name = "lre"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[build-dependencies]
+bindgen = "0.68"
+cc = "1.0"
+
+[dependencies]
+thiserror = "1.0"
+bitflags = "2.0"
+
+[dev-dependencies]
+libc = "0.2"
+zerocopy = "0.8"
+
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.dev]
+opt-level = 0
+debug = true
