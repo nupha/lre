@@ -1,7 +1,7 @@
 [package]
 name = "lre"
-version = "0.1.1"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 authors = ["John Ray <996351336@qq.com>"]
 description = "Rust bindings for the regular expression library from QuickJS"
 license = "MIT"
