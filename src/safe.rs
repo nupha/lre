@@ -414,8 +414,16 @@ fn exec_bytes_raw(
     // Get capture count
     let capture_count = capture_count(bytecode)?;
 
-    // Prepare capture array
-    let mut capture_ptrs: Vec<*mut u8> = vec![ptr::null_mut(); capture_count * 2];
+    // Prepare capture array.
+    // NOTE: lre_exec also stores loop counters at index
+    // `2 * capture_count + pc[0]` (see REOP_set_i32 / REOP_loop in
+    // libregexp.c), where the loop-counter index `pc[0]` is emitted
+    // as 0 by the compiler. That slot sits ONE past the
+    // `capture_count * 2` capture-group area, so we must reserve it
+    // here. Allocating only `capture_count * 2` caused an
+    // out-of-bounds write that corrupted the heap (manifesting as
+    // spurious GC "bad node" / libc heap-corruption aborts).
+    let mut capture_ptrs: Vec<*mut u8> = vec![ptr::null_mut(); capture_count * 2 + 1];
 
     // Call C function
     let result = unsafe {
