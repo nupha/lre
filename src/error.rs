@@ -44,7 +44,7 @@ impl RegexError {
         if error_msg.is_null() {
             RegexError::CompileError("unknown error".to_string())
         } else {
-            let c_str = std::ffi::CStr::from_ptr(error_msg);
+            let c_str = unsafe { std::ffi::CStr::from_ptr(error_msg) };
             RegexError::CompileError(c_str.to_string_lossy().into_owned())
         }
     }

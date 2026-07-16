@@ -1,9 +1,8 @@
 use std::{ffi::c_void, ops::Range};
 
-use crate::safe::{encode_utf8_surrogate, MatchResult};
 use crate::{
     error::Result,
-    safe::{self, RegexFlags, RegexInfo},
+    safe::{self, MatchResult, RegexFlags, RegexInfo, encode_utf8_surrogate},
 };
 
 /// A single match of a regex in a text.
@@ -51,6 +50,7 @@ impl Regex {
         &self.0.bytecode
     }
 
+    /// Returns the flags with which this regex was compiled.
     #[inline(always)]
     pub fn flags(&self) -> RegexFlags {
         self.0.flags()
@@ -59,13 +59,9 @@ impl Regex {
     /// Returns the names of all named capture groups.
     pub fn group_names(&self) -> Option<Box<[String]>> {
         if self.flags().contains(RegexFlags::NAMED_GROUPS) {
-            safe::get_group_names(self.bytecode()).ok().and_then(|x| {
-                if x.is_empty() {
-                    None
-                } else {
-                    Some(x)
-                }
-            })
+            safe::get_group_names(self.bytecode())
+                .ok()
+                .and_then(|x| if x.is_empty() { None } else { Some(x) })
         } else {
             None
         }
@@ -77,6 +73,19 @@ impl Regex {
         self.0.capture_count
     }
 
+    /// Executes the regex against the given byte slice, returning match
+    /// information (capture groups) if the pattern matches.
+    ///
+    /// # Arguments
+    /// * `bytes` - The input text as raw bytes.
+    /// * `bytes_offset` - Starting byte offset within `bytes` to search from.
+    /// * `is_wide` - If `true`, treats `bytes` as UTF-16LE (each group of
+    ///   2 bytes is one code unit). Positions are in bytes; if
+    ///   `is_wide == true`, both `bytes_offset` and the returned capture
+    ///   positions must be even.
+    /// * `opaque` - Opaque pointer forwarded to the C runtime (for timeout
+    ///   / stack-overflow callbacks). Pass `std::ptr::null_mut()` unless you
+    ///   have custom callbacks.
     #[inline(always)]
     pub fn exec(
         &self,
@@ -85,9 +94,24 @@ impl Regex {
         is_wide: bool,
         opaque: *mut c_void,
     ) -> Result<MatchResult> {
-        safe::exec_bytes(&self.0.bytecode, bytes, bytes_offset, is_wide, opaque)
+        safe::exec_bytes_raw(
+            &self.0.bytecode,
+            bytes.as_ptr(),
+            bytes.len(),
+            bytes_offset,
+            is_wide,
+            opaque,
+        )
     }
 
+    /// Returns `true` if the regex matches anywhere in `bytes`.
+    ///
+    /// This is a convenience wrapper around [`exec`](Self::exec) that only
+    /// checks whether a match exists, discarding capture details.
+    ///
+    /// # Arguments
+    /// * `bytes` - The input text as raw bytes.
+    /// * `is_wide` - If `true`, treats `bytes` as UTF-16LE.
     #[inline(always)]
     pub fn is_match(&self, bytes: &[u8], is_wide: bool) -> bool {
         self.exec(bytes, 0, is_wide, std::ptr::null_mut())
@@ -172,6 +196,7 @@ impl Regex {
     }
 
     /// Returns an iterator over all capture groups in the text.
+    #[inline(always)]
     pub fn captures_iter<'r, 't>(
         &'r self,
         bytes: &'t [u8],
@@ -222,6 +247,7 @@ impl Regex {
     }
 
     /// Splits the text by matches of the regex.
+    #[inline(always)]
     pub fn split<'r, 't>(&'r self, bytes: &'t [u8], is_wide: bool) -> Split<'r, 't> {
         Split {
             finder: self.find_iter(bytes, 0, is_wide),
@@ -232,21 +258,25 @@ impl Regex {
 
 impl<'t> Match<'t> {
     /// Returns the starting byte offset of the match in the text.
+    #[inline(always)]
     pub fn start(&self) -> usize {
         self.start
     }
 
     /// Returns the ending byte offset of the match in the text.
+    #[inline(always)]
     pub fn end(&self) -> usize {
         self.end
     }
 
     /// Returns the byte range of the match.
+    #[inline(always)]
     pub fn range(&self) -> Range<usize> {
         self.start..self.end
     }
 
     /// Returns the matched bytes slice.
+    #[inline(always)]
     pub fn as_bytes(&self) -> &'t [u8] {
         &self.bytes[self.start..self.end]
     }
@@ -271,16 +301,19 @@ impl<'t> Captures<'t> {
     }
 
     /// Returns the number of capture groups (including group 0).
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.matches.len()
     }
 
     /// Returns true if there are no capture groups.
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.matches.is_empty()
     }
 
     /// Returns an iterator over all capture groups.
+    #[inline(always)]
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = Option<Match<'a>>> + 'a {
         struct CapturesIterImpl<'a> {
             captures: &'a Captures<'a>,
@@ -437,26 +470,6 @@ impl<'r, 't> Iterator for Split<'r, 't> {
                     None
                 }
             }
-        }
-    }
-}
-
-/// Iterator over capture groups in a `Captures` object.
-pub struct CapturesIter<'a> {
-    captures: &'a Captures<'a>,
-    idx: usize,
-}
-
-impl<'a> Iterator for CapturesIter<'a> {
-    type Item = Option<Match<'a>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.idx < self.captures.len() {
-            let result = self.captures.get(self.idx);
-            self.idx += 1;
-            Some(result)
-        } else {
-            None
         }
     }
 }

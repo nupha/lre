@@ -1,24 +1,19 @@
-use std::borrow::Cow;
-use std::ffi::{c_void, CString};
-use std::os::raw::{c_char, c_int};
-use std::ptr;
-use std::slice;
+use std::{
+    borrow::Cow,
+    ffi::c_void,
+    os::raw::{c_char, c_int},
+    ptr, slice,
+};
 
 use bitflags::bitflags;
 
-use crate::error::{RegexError, Result};
-use crate::lre_get_flags;
-use crate::LRE_FLAG_DOTALL;
-use crate::LRE_FLAG_GLOBAL;
-use crate::LRE_FLAG_IGNORECASE;
-use crate::LRE_FLAG_INDICES;
-use crate::LRE_FLAG_MULTILINE;
-use crate::LRE_FLAG_NAMED_GROUPS;
-use crate::LRE_FLAG_STICKY;
-use crate::LRE_FLAG_UNICODE;
-use crate::LRE_FLAG_UNICODE_SETS;
-use crate::LRE_RET_MEMORY_ERROR;
-use crate::LRE_RET_TIMEOUT;
+use crate::{
+    LRE_FLAG_DOTALL, LRE_FLAG_GLOBAL, LRE_FLAG_IGNORECASE, LRE_FLAG_INDICES, LRE_FLAG_MULTILINE,
+    LRE_FLAG_NAMED_GROUPS, LRE_FLAG_STICKY, LRE_FLAG_UNICODE, LRE_FLAG_UNICODE_SETS,
+    LRE_RET_MEMORY_ERROR, LRE_RET_TIMEOUT,
+    error::{RegexError, Result},
+    lre_get_flags,
+};
 
 bitflags! {
     /// Compilation flags for regular expressions.
@@ -246,15 +241,7 @@ fn encode_utf8(code_point: u32) -> Vec<u8> {
 
 /// Safe wrapper for regex compilation.
 /// `pattern` is utf8 encoded bytes
-pub fn compile(pattern: &[u8], flags: RegexFlags) -> Result<RegexInfo> {
-    // let pattern: Cow<'_, [u8]> = if flags.is_unicode() {
-    //     Cow::Borrowed(pattern)
-    // } else {
-    //     // for non u,v flags,
-    //     // convert pattern to special encoding required by lre_compile
-    //     encode_utf8_surrogate(pattern)
-    // };
-
+pub(crate) fn compile(pattern: &[u8], flags: RegexFlags) -> Result<RegexInfo> {
     let pattern_len = pattern.len();
 
     // Prepare error buffer
@@ -319,41 +306,8 @@ pub fn compile(pattern: &[u8], flags: RegexFlags) -> Result<RegexInfo> {
     })
 }
 
-pub fn compile_str(pattern: &str, flags: RegexFlags) -> Result<RegexInfo> {
-    let bb = if flags.is_unicode() {
-        pattern.as_bytes().into()
-    } else {
-        // for non u,v flags,
-        // convert pattern to special encoding required by lre_compile
-        encode_utf8_surrogate(pattern)
-    };
-    compile(&bb, flags)
-}
-
-/// Gets the number of capture groups in compiled bytecode.
-pub fn capture_count(bytecode: &[u8]) -> Result<usize> {
-    if bytecode.is_empty() {
-        return Err(RegexError::InvalidBytecode);
-    }
-
-    let count = unsafe { crate::lre_get_capture_count(bytecode.as_ptr()) as usize };
-
-    Ok(count)
-}
-
-/// Gets the flags from compiled bytecode.
-pub fn get_flags(bytecode: &[u8]) -> Result<u32> {
-    if bytecode.is_empty() {
-        return Err(RegexError::InvalidBytecode);
-    }
-
-    let flags = unsafe { crate::lre_get_flags(bytecode.as_ptr()) as u32 };
-
-    Ok(flags)
-}
-
 /// Gets named group information from compiled bytecode.
-pub fn get_group_names(bytecode: &[u8]) -> Result<Box<[String]>> {
+pub(crate) fn get_group_names(bytecode: &[u8]) -> Result<Box<[String]>> {
     if bytecode.is_empty() {
         return Err(RegexError::InvalidBytecode);
     }
@@ -364,9 +318,11 @@ pub fn get_group_names(bytecode: &[u8]) -> Result<Box<[String]>> {
     }
 
     // Get capture count to know how many names to expect
-    let capture_count = capture_count(bytecode)?;
+    let capture_count = unsafe { crate::lre_get_capture_count(bytecode.as_ptr()) as usize };
 
-    // Parse null-terminated strings
+    // Parse null-terminated strings.
+    // Each entry is: name\0 + 1-byte scope (= LRE_GROUP_NAME_TRAILER_LEN).
+    // Unnamed groups have an empty name (\0 + scope).
     let mut names = Vec::with_capacity(capture_count);
     let mut current = names_ptr;
 
@@ -379,8 +335,8 @@ pub fn get_group_names(bytecode: &[u8]) -> Result<Box<[String]>> {
         let c_str = unsafe { std::ffi::CStr::from_ptr(current) };
         names.push(c_str.to_string_lossy().into());
 
-        // Move to next string
-        current = unsafe { current.add(c_str.to_bytes_with_nul().len()) };
+        // Advance past the name + NUL + trailing scope byte
+        current = unsafe { current.add(c_str.to_bytes_with_nul().len() + 1) };
     }
 
     Ok(names.into())
@@ -397,7 +353,7 @@ pub struct MatchResult {
 }
 
 /// Executes a regex on the given bytes and wide flag.
-fn exec_bytes_raw(
+pub(crate) fn exec_bytes_raw(
     bytecode: &[u8],
     bytes_ptr: *const u8,
     bytes_len: usize,
@@ -412,18 +368,25 @@ fn exec_bytes_raw(
     }
 
     // Get capture count
-    let capture_count = capture_count(bytecode)?;
+    let capture_count = if bytecode.is_empty() {
+        return Err(RegexError::InvalidBytecode);
+    } else {
+        unsafe { crate::lre_get_capture_count(bytecode.as_ptr()) as usize }
+    };
 
     // Prepare capture array.
-    // NOTE: lre_exec also stores loop counters at index
-    // `2 * capture_count + pc[0]` (see REOP_set_i32 / REOP_loop in
-    // libregexp.c), where the loop-counter index `pc[0]` is emitted
-    // as 0 by the compiler. That slot sits ONE past the
-    // `capture_count * 2` capture-group area, so we must reserve it
-    // here. Allocating only `capture_count * 2` caused an
-    // out-of-bounds write that corrupted the heap (manifesting as
-    // spurious GC "bad node" / libc heap-corruption aborts).
-    let mut capture_ptrs: Vec<*mut u8> = vec![ptr::null_mut(); capture_count * 2 + 1];
+    // NOTE: lre_exec also stores loop counters / registers in the
+    // capture array beyond the capture-group slots.  Each register
+    // is stored at index `2 * capture_count + register_index` (see
+    // REOP_set_i32 / REOP_loop / REOP_loop_check_adv_split_* in
+    // libregexp.c).  The compiler sets register_count in the
+    // bytecode header; we must reserve `capture_count * 2 +
+    // register_count` total slots.  Using `lre_get_alloc_count()`
+    // (the C library's own canonical formula) instead of a
+    // hardcoded `capture_count * 2 + 1` avoids under-allocation
+    // for patterns with multiple / nested quantifiers.
+    let alloc_count = unsafe { crate::lre_get_alloc_count(bytecode.as_ptr()) as usize };
+    let mut capture_ptrs: Vec<*mut u8> = vec![ptr::null_mut(); alloc_count];
 
     // Call C function
     let result = unsafe {
@@ -488,124 +451,30 @@ fn exec_bytes_raw(
     }
 }
 
-/// Executes a regex on raw bytes. Encoding of bytes data is not considered.
-#[inline(always)]
-pub fn exec_bytes(
-    bytecode: &[u8],
-    bytes: &[u8],
-    bytes_offset: usize,
-    is_wide: bool,
-    opaque: *mut c_void,
-) -> Result<MatchResult> {
-    exec_bytes_raw(
-        bytecode,
-        bytes.as_ptr(),
-        bytes.len(),
-        bytes_offset,
-        is_wide,
-        opaque,
-    )
-}
-
-/// Executes a regex on ASCII text.
-///
-/// This function is optimized for ASCII-only text. It will return an error if the input
-/// contains non-ASCII characters. For Unicode text, use [`exec_utf16`] instead.
-///
-/// # Arguments
-/// * `bytecode` - Compiled regex bytecode from [`compile`]
-/// * `text` - ASCII text to match against (must contain only ASCII characters)
-/// * `start_pos` - Starting position in the text (in bytes)
-///
-/// # Returns
-/// * `Ok(MatchResult)` with match information if successful
-/// * `Err(RegexError::InvalidBytecode)` if the text contains non-ASCII characters
-#[inline(always)]
-pub fn exec_ascii(
-    bytecode: &[u8],
-    text: &str,
-    start_pos: usize,
-    opaque: *mut c_void,
-) -> Result<MatchResult> {
-    if text.is_ascii() {
-        exec_bytes_raw(
-            bytecode,
-            text.as_ptr(),
-            text.len(),
-            start_pos,
-            false,
-            opaque,
-        )
-    } else {
-        Err(RegexError::InvalidBytecode)
-    }
-}
-
-/// Executes a regex on UTF-16 encoded text.
-///
-/// This function is designed for Unicode text encoded as UTF-16. It supports
-/// full Unicode matching when the [`RegexFlags::unicode()`] flag is enabled.
-///
-/// # Arguments
-/// * `bytecode` - Compiled regex bytecode from [`compile`]
-/// * `text` - UTF-16 encoded text to match against (as a slice of `u16`)
-/// * `start_pos` - Starting position in the text (in UTF-16 code units)
-///
-/// # Returns
-/// * `Ok(MatchResult)` with match information if successful
-/// * `Err(RegexError)` if an error occurs during execution
-///
-/// # Notes
-/// * Capture positions are returned in UTF-16 code units, not bytes
-/// * For ASCII text, consider using [`exec_ascii`] for better performance
-/// * The text must be valid UTF-16 (properly encoded surrogate pairs)
-#[inline(always)]
-pub fn exec_utf16(
-    bytecode: &[u8],
-    text: &[u16],
-    start_pos: usize,
-    opaque: *mut c_void,
-) -> Result<MatchResult> {
-    exec_bytes_raw(
-        bytecode,
-        text.as_ptr().cast::<u8>(),
-        text.len() << 1,
-        start_pos << 1,
-        true,
-        opaque,
-    )
-}
-
-/// Safe wrapper for escape sequence parsing.
-pub fn parse_escape(escape_seq: &str, allow_utf16: bool) -> Result<u32> {
-    let seq_cstr = CString::new(escape_seq)
-        .map_err(|e| RegexError::InternalError(format!("invalid escape sequence: {}", e)))?;
-
-    let mut ptr = seq_cstr.as_ptr() as *const std::os::raw::c_uchar;
-    let result = unsafe {
-        crate::lre_parse_escape(
-            &mut ptr as *mut *const std::os::raw::c_uchar,
-            allow_utf16 as c_int,
-        )
-    };
-
-    match result {
-        -1 => Err(RegexError::CompileError(
-            "malformed escape sequence".to_string(),
-        )),
-        -2 => Err(RegexError::CompileError(
-            "unrecognized escape sequence".to_string(),
-        )),
-        code if code >= 0 => Ok(code as u32),
-        _ => Err(RegexError::InternalError(
-            "unexpected error from lre_parse_escape".to_string(),
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test helper: runs regex on ASCII text, used by the test cases below.
+    fn exec_ascii(
+        bytecode: &[u8],
+        text: &str,
+        start_pos: usize,
+        opaque: *mut c_void,
+    ) -> Result<MatchResult> {
+        if text.is_ascii() {
+            exec_bytes_raw(
+                bytecode,
+                text.as_ptr(),
+                text.len(),
+                start_pos,
+                false,
+                opaque,
+            )
+        } else {
+            Err(RegexError::InvalidBytecode)
+        }
+    }
 
     #[test]
     fn test_lre_flags_comprehensive() {
@@ -892,7 +761,8 @@ mod tests {
         let pattern = "𠮷";
         let flags = RegexFlags::empty();
 
-        let result = compile_str(pattern, flags);
+        let b = encode_utf8_surrogate(pattern);
+        let result = compile(&b, flags);
         assert!(
             result.is_ok(),
             "Non-BMP character compilation should succeed"
@@ -906,7 +776,8 @@ mod tests {
         let pattern = "[𠮷中]"; // Character class with non-BMP, BMP, and ASCII
         let flags = RegexFlags::empty();
 
-        let info = compile_str(pattern, flags).unwrap();
+        let b = encode_utf8_surrogate(pattern);
+        let info = compile(&b, flags).unwrap();
         assert!(!info.bytecode.is_empty());
         assert_eq!(info.capture_count, 1);
     }
@@ -923,48 +794,12 @@ mod tests {
         let regex_info = compile_result.unwrap();
 
         // Test case 1: capture_count function
-        let count = capture_count(&regex_info.bytecode);
-        assert!(count.is_ok(), "Getting capture count should succeed");
-        assert_eq!(count.unwrap(), 3, "Should have 3 capture groups");
+        assert_eq!(regex_info.capture_count, 3, "Should have 3 capture groups");
 
-        // Test case 2: capture_count with empty bytecode
-        let empty_bytecode: Vec<u8> = Vec::new();
-        let result = capture_count(&empty_bytecode);
-        assert!(result.is_err(), "Empty bytecode should return error");
-
-        if let Err(err) = result {
-            match err {
-                RegexError::InvalidBytecode => {
-                    // Expected error
-                }
-                _ => panic!("Expected InvalidBytecode error, got {:?}", err),
-            }
-        }
-
-        // Test case 3: get_flags function
-        let retrieved_flags = get_flags(&regex_info.bytecode);
-        assert!(retrieved_flags.is_ok(), "Getting flags should succeed");
-
+        // Test case 2: flags retrieval via RegexInfo::flags
+        let retrieved_flags = regex_info.flags().to_u32();
         let expected_flags = LRE_FLAG_IGNORECASE | LRE_FLAG_MULTILINE;
-        assert_eq!(
-            retrieved_flags.unwrap(),
-            expected_flags,
-            "Flags should match"
-        );
-
-        // Test case 4: get_flags with empty bytecode
-        let empty_bytecode: Vec<u8> = Vec::new();
-        let result = get_flags(&empty_bytecode);
-        assert!(result.is_err(), "Empty bytecode should return error");
-
-        if let Err(err) = result {
-            match err {
-                RegexError::InvalidBytecode => {
-                    // Expected error
-                }
-                _ => panic!("Expected InvalidBytecode error, got {:?}", err),
-            }
-        }
+        assert_eq!(retrieved_flags, expected_flags, "Flags should match");
 
         // Test case 5: get_group_names with unnamed groups
         let group_names = get_group_names(&regex_info.bytecode);
@@ -1240,6 +1075,65 @@ mod tests {
 
         if let Some((start, end)) = match_result.captures[0] {
             assert_eq!(&text[start..end], "1", "Should match digit at position 1");
+        }
+    }
+
+    /// Verify capture-array allocation is correct for various register counts.
+    ///
+    /// `lre_exec` stores loop counters/registers in slots beyond the
+    /// capture-group area at index `2*capture_count + register_index`.
+    /// Using `lre_get_alloc_count()` (vs a hardcoded `+1`) ensures the
+    /// buffer is large enough for patterns with multiple nested quantifiers.
+    #[test]
+    fn test_capture_alloc_count_multiple_registers() {
+        // Register allocation depends on:
+        //   a) Quantifier type: ?, *, + use split+goto (no regs); {n,m} uses
+        //      set_i32+loop (1 reg) and optionally set_char_pos (+1 reg).
+        //   b) `re_need_check_adv()` on the atom: if the atom always advances
+        //      (e.g. `a` or `\d`), zero-advance check is skipped → no set_char_pos.
+        //      If the atom CAN match zero-length (e.g. `(?:a{0,5})`), then
+        //      set_char_pos IS emitted → +1 reg.
+        //   c) Nested {n,m}: the outer's set_i32 (+ set_char_pos) is inserted
+        //      BEFORE the inner body via `dbuf_insert`, so the linear
+        //      `compute_register_count` scan sees both simultaneously.
+        let cases: &[(&[u8], &str)] = &[
+            (b"abc", "abc"),                      // reg=0: no quantifier
+            (b"a+", "aaa"),                       // reg=0: split+goto only
+            (b"a*", "aaa"),                       // reg=0: split+goto only
+            (b"a{1,5}", "aaa"),                   // reg=1: set_i32, no z-adv
+            (b"a{0,5}", "aaa"),                   // reg=1: set_i32, no z-adv (a always advances)
+            (b"(?:a{0,5}){0,5}", "aaa"), // reg=3: outer set_i32+set_char_pos, inner set_i32
+            (b"(?:(?:a{0,5}){0,5}){0,5}", "aaa"), // reg=5+: triple nesting
+        ];
+
+        for (i, &(pattern, text)) in cases.iter().enumerate() {
+            let info = compile(pattern, RegexFlags::empty())
+                .unwrap_or_else(|e| panic!("case {}: compile failed: {:?}", i, e));
+
+            let register_count = info.bytecode[3] as usize;
+
+            // The C lib's own formula must equal capture_count * 2 + register_count
+            let alloc_count =
+                unsafe { crate::lre_get_alloc_count(info.bytecode.as_ptr()) as usize };
+            assert_eq!(
+                alloc_count,
+                info.capture_count * 2 + register_count,
+                "case {}: pattern {:?}: lre_get_alloc_count mismatch (cap={}, reg={})",
+                i,
+                pattern,
+                info.capture_count,
+                register_count,
+            );
+
+            // Execution must not panic / corrupt heap (registers written
+            // beyond the capture-pair area must land in valid slots).
+            let result = exec_ascii(&info.bytecode, text, 0, std::ptr::null_mut())
+                .unwrap_or_else(|e| panic!("case {}: exec failed: {:?}", i, e));
+            assert!(
+                result.success,
+                "case {}: pattern {:?} should match '{}'",
+                i, pattern, text,
+            );
         }
     }
 }
